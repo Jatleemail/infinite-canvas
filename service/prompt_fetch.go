@@ -122,7 +122,11 @@ func buildGptImage2Prompts() ([]model.Prompt, error) {
 		if prompt == "" {
 			continue
 		}
-		image := gptImage2RawBase + "/" + item.ImageDir + "/output.jpg"
+		imageDir := strings.TrimSpace(item.ImageDir)
+		if imageDir == "" || strings.EqualFold(imageDir, "null") {
+			continue
+		}
+		image := gptImage2RawBase + "/" + strings.Trim(imageDir, "/") + "/output.jpg"
 		items = append(items, model.Prompt{ID: "gpt-image-2-prompts-" + leftPad(len(items)+1), Title: item.Title, CoverURL: image, Prompt: prompt, Tags: tagsFromCategory(item.Category), CreatedAt: item.AddedAt, UpdatedAt: item.AddedAt, Preview: markdownPreview([]string{image})})
 	}
 	return items, nil
