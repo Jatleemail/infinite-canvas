@@ -8,9 +8,33 @@ import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { imageToDataUrl } from "@/services/image-storage";
 import type { ReferenceImage } from "@/types/image";
 
+export type ChatCompletionToolCall = {
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+};
+
 export type ChatCompletionMessage = {
-    role: "system" | "user" | "assistant";
-    content: string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }>;
+    role: "system" | "user" | "assistant" | "tool";
+    content: string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> | null;
+    tool_calls?: ChatCompletionToolCall[];
+    tool_call_id?: string;
+    name?: string;
+};
+
+export type ChatToolDefinition = {
+    type: "function";
+    function: {
+        name: string;
+        description: string;
+        parameters: Record<string, unknown>;
+    };
+};
+
+export type ChatCompletionTurn = {
+    text: string;
+    tool_calls?: ChatCompletionToolCall[];
+    finish_reason?: string;
 };
 
 type ImageApiResponse = {
@@ -313,6 +337,39 @@ export async function requestImageQuestion(config: AiConfig, messages: ChatCompl
     }
     refreshRemoteUser(config);
     return answer || "没有返回内容";
+}
+
+/**
+ * Non-streaming chat completion with optional tool calling support.
+ * Used by the canvas assistant when Agent mode is enabled. Tool calls
+ * (if present in the response) are returned as-is so the caller can
+ * execute them locally and continue the dialog with tool results.
+ */
+export async function requestChatTurn(config: AiConfig, messages: ChatCompletionMessage[], tools?: ChatToolDefinition[]): Promise<ChatCompletionTurn> {
+    try {
+        const response = await axios.post<{ choices?: Array<{ message?: { content?: string | null; tool_calls?: ChatCompletionToolCall[] }; finish_reason?: string }>; code?: number; msg?: string }>(
+            aiApiUrl(config, "/chat/completions"),
+            {
+                model: config.model,
+                messages: withSystemMessage(config, messages),
+                stream: false,
+                ...(tools && tools.length ? { tools, tool_choice: "auto" } : {}),
+            },
+            { headers: aiHeaders(config, "application/json") },
+        );
+        const payload = response.data;
+        if (typeof payload.code === "number" && payload.code !== 0) throw new Error(payload.msg || "请求失败");
+        const choice = payload.choices?.[0];
+        const message = choice?.message;
+        refreshRemoteUser(config);
+        return {
+            text: typeof message?.content === "string" ? message.content : "",
+            tool_calls: message?.tool_calls,
+            finish_reason: choice?.finish_reason,
+        };
+    } catch (error) {
+        throw new Error(readAxiosError(error, "请求失败"));
+    }
 }
 
 export async function fetchImageModels(config: AiConfig) {

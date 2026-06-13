@@ -114,7 +114,7 @@ function resolveEffectiveConfig(config: AiConfig, modelChannel: AdminPublicSetti
     const fallbackModel = validDefault(modelChannel.defaultModel, textModels) || fallbackTextModel;
     const fallbackImageModel = validDefault(modelChannel.defaultImageModel, imageModels) || preferredModel(imageModels, isImageModelName);
     const fallbackVideoModel = validDefault(modelChannel.defaultVideoModel, videoModels) || preferredModel(videoModels, isVideoModelName);
-    const fallbackAudioModel = preferredModel(audioModels, isAudioModelName);
+    const fallbackAudioModel = validDefault(modelChannel.defaultAudioModel, audioModels) || preferredModel(audioModels, isAudioModelName);
     return {
         ...config,
         channelMode,
@@ -142,12 +142,18 @@ function preferredModel(models: string[], predicate: (model: string) => boolean)
 
 function isVideoModelName(model: string) {
     const value = model.toLowerCase();
-    return value.includes("seedance") || value.includes("video") || value.includes("sora") || value.includes("veo") || value.includes("kling") || value.includes("wan") || value.includes("hailuo");
+    if (value.includes("seedance") || value.includes("video") || value.includes("sora") || value.includes("veo") || value.includes("kling") || value.includes("wan") || value.includes("hailuo")) return true;
+    // Vidu 视频系列：viduq3-* / viduq2-pro / viduq2-turbo / viduq2-pro-fast / viduq1 / viduq1-classic / vidu2.0
+    if (value.startsWith("viduq3")) return true;
+    if (value === "viduq2-pro" || value === "viduq2-turbo" || value === "viduq2-pro-fast") return true;
+    if (value === "viduq1" || value === "viduq1-classic") return true;
+    if (value === "vidu2.0") return true;
+    return false;
 }
 
 function isImageModelName(model: string) {
     const value = model.toLowerCase();
-    return !isVideoModelName(model) && !isAudioModelName(model) && (value.includes("seedream") || value.includes("gpt-image") || value.includes("image") || value.includes("dall-e") || value.includes("dalle") || value.includes("imagen") || value.includes("flux") || value.includes("sdxl") || value.includes("stable-diffusion") || value.includes("midjourney"));
+    return !isVideoModelName(model) && !isAudioModelName(model) && (value.includes("seedream") || value.includes("gpt-image") || value.includes("image") || value.includes("dall-e") || value.includes("dalle") || value.includes("imagen") || value.includes("flux") || value.includes("sdxl") || value.includes("stable-diffusion") || value.includes("midjourney") || value.startsWith("vidu"));
 }
 
 function isAudioModelName(model: string) {

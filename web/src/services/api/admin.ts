@@ -157,7 +157,7 @@ export async function deleteAdminAsset(token: string, id: string) {
 }
 
 export type AdminModelChannel = {
-    protocol: "openai";
+    protocol: "openai" | "vidu";
     name: string;
     baseUrl: string;
     apiKey: string;
@@ -174,6 +174,7 @@ export type AdminPublicModelChannelSettings = {
     defaultImageModel: string;
     defaultVideoModel: string;
     defaultTextModel: string;
+    defaultAudioModel: string;
     systemPrompt: string;
     allowCustomChannel: boolean;
 };

@@ -62,7 +62,20 @@ export function isSeedanceVideoConfig(config: Pick<AiConfig, "model" | "videoMod
 
 export function isSeedanceVideoModel(model: string) {
     const value = model.toLowerCase();
-    return value.includes("seedance") || value.includes("doubao-seedance");
+    return value.includes("seedance") || value.includes("doubao-seedance") || isViduVideoModel(value);
+}
+
+// isViduVideoModel 判断给定模型名是否是 Vidu 的视频系列（img2video / multiframe）。
+// Vidu 视频模型族：viduq3-*、viduq2-pro/turbo/pro-fast、viduq1、viduq1-classic、vidu2.0。
+// 注意 `viduq2`（不带后缀）是 Vidu 的图像默认模型，不计入视频。
+export function isViduVideoModel(model: string) {
+    const value = model.toLowerCase().trim();
+    if (!value) return false;
+    if (value.startsWith("viduq3")) return true;
+    if (value === "viduq2-pro" || value === "viduq2-turbo" || value === "viduq2-pro-fast") return true;
+    if (value === "viduq1" || value === "viduq1-classic") return true;
+    if (value === "vidu2.0") return true;
+    return false;
 }
 
 export function isSeedanceFastModel(model: string) {

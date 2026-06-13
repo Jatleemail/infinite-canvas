@@ -21,7 +21,7 @@ import { useAssetStore } from "@/stores/use-asset-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { cropDataUrl, splitDataUrl, upscaleDataUrl } from "../utils/canvas-image-data";
 import { fitNodeSize, nodeSizeFromRatio } from "../utils/canvas-node-size";
-import { App, Button, Dropdown, Modal } from "antd";
+import { App, Button, Dropdown, Modal, Tooltip } from "antd";
 import { NODE_DEFAULT_SIZE, getNodeSpec } from "../constants";
 import { ActiveConnectionPath, ConnectionPath } from "../components/canvas-connections";
 import { CanvasConfigComposer } from "../components/canvas-config-composer";
@@ -44,10 +44,13 @@ import { AssetPickerModal, type AssetPickerTab, type InsertAssetPayload } from "
 import { CanvasZoomControls } from "../components/canvas-zoom-controls";
 import { useCanvasStore } from "../stores/use-canvas-store";
 import { buildCanvasResourceReferences, buildNodeMentionReferences } from "../utils/canvas-resource-references";
+import type { AssistantToolDispatcher } from "../utils/assistant-tools";
 import {
     CanvasNodeType,
+    type CanvasAssistantAudio,
     type CanvasAssistantImage,
     type CanvasAssistantSession,
+    type CanvasAssistantVideo,
     type CanvasConnection,
     type CanvasImageGenerationType,
     type CanvasNodeData,
@@ -1275,6 +1278,18 @@ function InfiniteCanvasPage() {
                 return;
             }
 
+            if (isModifierShortcut && !event.altKey && key === "i") {
+                event.preventDefault();
+                if (assistantMounted && !assistantCollapsed) {
+                    setAssistantCollapsed(true);
+                    window.setTimeout(() => setAssistantMounted(false), 500);
+                } else {
+                    setAssistantMounted(true);
+                    setAssistantCollapsed(false);
+                }
+                return;
+            }
+
             if (event.key === "Delete" || event.key === "Backspace") {
                 if (selectedNodeIdsRef.current.size) {
                     deleteNodes(new Set(selectedNodeIdsRef.current));
@@ -1302,7 +1317,7 @@ function InfiniteCanvasPage() {
 
         window.addEventListener("keydown", handleKeyDown);
         return () => window.removeEventListener("keydown", handleKeyDown);
-    }, [copySelectedNodes, deleteConnection, deleteNodes, pasteCopiedNodes, pasteSystemClipboard, redoCanvas, selectedConnectionId, setConnecting, undoCanvas]);
+    }, [assistantCollapsed, assistantMounted, copySelectedNodes, deleteConnection, deleteNodes, pasteCopiedNodes, pasteSystemClipboard, redoCanvas, selectedConnectionId, setConnecting, undoCanvas]);
 
     const handleConnectStart = useCallback(
         (event: ReactMouseEvent, nodeId: string, handleType: "source" | "target") => {
@@ -2267,6 +2282,66 @@ function InfiniteCanvasPage() {
         [screenToCanvas, size.height, size.width],
     );
 
+    const insertAssistantVideo = useCallback(
+        (video: CanvasAssistantVideo) => {
+            const spec = NODE_DEFAULT_SIZE[CanvasNodeType.Video];
+            const nextSize = fitNodeSize(spec.width, spec.height, VIDEO_NODE_MAX_WIDTH, VIDEO_NODE_MAX_HEIGHT);
+            const center = screenToCanvas((containerRef.current?.getBoundingClientRect().left || 0) + size.width / 2, (containerRef.current?.getBoundingClientRect().top || 0) + size.height / 2);
+            const id = `video-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+            setNodes((prev) => [
+                ...prev,
+                {
+                    id,
+                    type: CanvasNodeType.Video,
+                    title: video.prompt.slice(0, 32) || "Generated Video",
+                    position: { x: center.x - nextSize.width / 2, y: center.y - nextSize.height / 2 },
+                    width: nextSize.width,
+                    height: nextSize.height,
+                    metadata: { content: video.url, storageKey: video.storageKey, status: NODE_STATUS_SUCCESS, mimeType: video.mimeType || "video/mp4", prompt: video.prompt },
+                },
+            ]);
+            setSelectedNodeIds(new Set([id]));
+            setSelectedConnectionId(null);
+        },
+        [screenToCanvas, size.height, size.width],
+    );
+
+    const insertAssistantAudio = useCallback(
+        (audio: CanvasAssistantAudio) => {
+            const spec = NODE_DEFAULT_SIZE[CanvasNodeType.Audio];
+            const center = screenToCanvas((containerRef.current?.getBoundingClientRect().left || 0) + size.width / 2, (containerRef.current?.getBoundingClientRect().top || 0) + size.height / 2);
+            const id = `audio-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+            setNodes((prev) => [
+                ...prev,
+                {
+                    id,
+                    type: CanvasNodeType.Audio,
+                    title: audio.prompt.slice(0, 32) || "Generated Audio",
+                    position: { x: center.x - spec.width / 2, y: center.y - spec.height / 2 },
+                    width: spec.width,
+                    height: spec.height,
+                    metadata: { content: audio.url, storageKey: audio.storageKey, status: NODE_STATUS_SUCCESS, mimeType: audio.mimeType || "audio/mpeg", prompt: audio.prompt },
+                },
+            ]);
+            setSelectedNodeIds(new Set([id]));
+            setSelectedConnectionId(null);
+        },
+        [screenToCanvas, size.height, size.width],
+    );
+
+    const assistantToolDispatcher = useMemo<AssistantToolDispatcher>(
+        () => ({
+            getNodes: () => nodesRef.current,
+            getConnections: () => connectionsRef.current,
+            getSelectedNodeIds: () => selectedNodeIdsRef.current,
+            setNodes: (updater) => setNodes(updater),
+            setConnections: (updater) => setConnections(updater),
+            setSelectedNodeIds: (ids) => setSelectedNodeIds(ids),
+            getCanvasCenter,
+        }),
+        [getCanvasCenter],
+    );
+
     const handleAssetInsert = useCallback(
         (payload: InsertAssetPayload) => {
             if (payload.kind === "text") {
@@ -2600,13 +2675,17 @@ function InfiniteCanvasPage() {
             {assistantMounted ? (
                 <CanvasAssistantPanel
                     nodes={nodes}
+                    connections={connections}
                     selectedNodeIds={selectedNodeIds}
                     sessions={chatSessions}
                     activeSessionId={activeChatId}
+                    toolDispatcher={assistantToolDispatcher}
                     onSelectNodeIds={setSelectedNodeIds}
                     onSessionsChange={handleAssistantSessionsChange}
                     onInsertImage={insertAssistantImage}
                     onInsertText={insertAssistantText}
+                    onInsertVideo={insertAssistantVideo}
+                    onInsertAudio={insertAssistantAudio}
                     onPasteImage={pasteAssistantImage}
                     onCollapseStart={() => setAssistantCollapsed(true)}
                     onCollapse={() => setAssistantMounted(false)}
@@ -2749,15 +2828,17 @@ function CanvasTopBar({
                     {assistantCollapsed ? (
                         <>
                             <span className="h-6 w-px" style={{ background: theme.toolbar.border }} />
-                            <Button
-                                type="text"
-                                className="!h-10 !rounded-xl !px-3 !font-medium"
-                                style={{ background: theme.toolbar.panel, color: theme.node.text, boxShadow: "0 10px 30px rgba(28,25,23,.10)" }}
-                                icon={<MessageSquare className="size-4" />}
-                                onClick={onExpandAssistant}
-                            >
-                                助手
-                            </Button>
+                            <Tooltip title="打开画布助手 (Ctrl / Cmd + I)">
+                                <Button
+                                    type="text"
+                                    className="!h-10 !rounded-xl !px-3 !font-medium"
+                                    style={{ background: theme.toolbar.panel, color: theme.node.text, boxShadow: "0 10px 30px rgba(28,25,23,.10)" }}
+                                    icon={<MessageSquare className="size-4" />}
+                                    onClick={onExpandAssistant}
+                                >
+                                    助手
+                                </Button>
+                            </Tooltip>
                         </>
                     ) : null}
                 </div>
@@ -2775,6 +2856,7 @@ function CanvasTopBar({
                     <Shortcut keys={["Ctrl / Cmd", "Shift", "Z"]} value="重做" />
                     <Shortcut keys={["Ctrl / Cmd", "Y"]} value="重做" />
                     <Shortcut keys={["Delete / Backspace"]} value="删除选中" />
+                    <Shortcut keys={["Ctrl / Cmd", "I"]} value="打开 / 收起画布助手" />
                     <Shortcut keys={["Esc"]} value="取消选择并关闭浮层" />
                     <Shortcut keys={["拖入图片/视频/音频"]} value="上传到画布" />
                 </div>

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { ArrowUp, History, ImageIcon, LoaderCircle, MessageSquare, PanelRightClose, Plus, RotateCcw, Settings2, Sparkles, Trash2, X } from "lucide-react";
+import { ArrowUp, History, ImageIcon, LoaderCircle, MessageSquare, Music2, PanelRightClose, Plus, RotateCcw, Settings2, Sparkles, Trash2, Video, Wrench, X, Zap } from "lucide-react";
 import { Button, Modal, Tooltip } from "antd";
 import { motion } from "motion/react";
 
@@ -12,7 +12,9 @@ import { CreditSymbol, requestCreditCost } from "@/constant/credits";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { nanoid } from "nanoid";
 import { cn } from "@/lib/utils";
-import { requestEdit, requestGeneration, requestImageQuestion, type ChatCompletionMessage } from "@/services/api/image";
+import { requestEdit, requestGeneration, requestImageQuestion, requestChatTurn, type ChatCompletionMessage } from "@/services/api/image";
+import { requestVideoGeneration, storeGeneratedVideo } from "@/services/api/video";
+import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audio";
 import { imageToDataUrl, uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -21,27 +23,35 @@ import type { ReferenceImage } from "@/types/image";
 import { DiaTextReveal } from "@/components/ui/dia-text-reveal";
 import { CanvasImageSettingsPopover } from "./canvas-image-settings-popover";
 import { CanvasPromptLibrary } from "./canvas-prompt-library";
-import { CanvasNodeType, type CanvasAssistantImage, type CanvasAssistantMessage, type CanvasAssistantReference, type CanvasAssistantSession, type CanvasNodeData } from "../types";
+import { buildCanvasSummary } from "../utils/canvas-summary";
+import { ASSISTANT_TOOL_SCHEMAS, executeAssistantTool, type AssistantToolDispatcher } from "../utils/assistant-tools";
+import { CanvasNodeType, type CanvasAssistantAudio, type CanvasAssistantImage, type CanvasAssistantMessage, type CanvasAssistantReference, type CanvasAssistantSession, type CanvasAssistantToolCallEntry, type CanvasAssistantVideo, type CanvasConnection, type CanvasNodeData } from "../types";
 
-type AssistantMode = "ask" | "image";
+type AssistantMode = "ask" | "image" | "video" | "audio";
+
+const AGENT_MAX_ROUNDS = 6;
 const PANEL_MOTION_MS = 500;
 const PANEL_MOTION_SECONDS = PANEL_MOTION_MS / 1000;
 
 type CanvasAssistantPanelProps = {
     nodes: CanvasNodeData[];
+    connections: CanvasConnection[];
     selectedNodeIds: Set<string>;
     sessions: CanvasAssistantSession[];
     activeSessionId: string | null;
+    toolDispatcher: AssistantToolDispatcher;
     onSelectNodeIds: (ids: Set<string>) => void;
     onSessionsChange: (sessions: CanvasAssistantSession[], activeSessionId: string | null) => void;
     onInsertImage: (image: CanvasAssistantImage) => void;
     onInsertText: (text: string) => void;
+    onInsertVideo: (video: CanvasAssistantVideo) => void;
+    onInsertAudio: (audio: CanvasAssistantAudio) => void;
     onPasteImage: (file: File) => void;
     onCollapseStart: () => void;
     onCollapse: () => void;
 };
 
-export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeSessionId, onSelectNodeIds, onSessionsChange, onInsertImage, onInsertText, onPasteImage, onCollapseStart, onCollapse }: CanvasAssistantPanelProps) {
+export function CanvasAssistantPanel({ nodes, connections, selectedNodeIds, sessions, activeSessionId, toolDispatcher, onSelectNodeIds, onSessionsChange, onInsertImage, onInsertText, onInsertVideo, onInsertAudio, onPasteImage, onCollapseStart, onCollapse }: CanvasAssistantPanelProps) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const effectiveConfig = useEffectiveConfig();
     const modelCosts = useConfigStore((state) => state.publicSettings?.modelChannel.modelCosts);
@@ -54,6 +64,7 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
     const [mode, setMode] = useState<AssistantMode>("image");
     const [prompt, setPrompt] = useState("");
     const [isRunning, setIsRunning] = useState(false);
+    const [agentEnabled, setAgentEnabled] = useState(true);
     const [checkedChatIds, setCheckedChatIds] = useState<string[]>([]);
     const [deleteChatIds, setDeleteChatIds] = useState<string[]>([]);
     const [closing, setClosing] = useState(false);
@@ -80,6 +91,14 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
     const selectedNodeKey = useMemo(() => Array.from(selectedNodeIds).sort().join(","), [selectedNodeIds]);
     const allSelectedReferences = useMemo(() => buildAssistantReferences(nodes, selectedNodeIds), [nodes, selectedNodeIds]);
     const selectedReferences = useMemo(() => allSelectedReferences.filter((item) => !removedReferenceIds.has(item.id)), [allSelectedReferences, removedReferenceIds]);
+    const unsupportedReferenceCount = useMemo(() => {
+        const nodeById = new Map(nodes.map((node) => [node.id, node]));
+        return Array.from(selectedNodeIds).reduce((count, id) => {
+            const node = nodeById.get(id);
+            if (!node) return count;
+            return node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio ? count + 1 : count;
+        }, 0);
+    }, [nodes, selectedNodeIds]);
     const assistantConfig = useMemo(() => ({ ...effectiveConfig, count: effectiveConfig.canvasImageCount || effectiveConfig.count }), [effectiveConfig]);
     const iconButtonStyle = { color: theme.node.muted };
 
@@ -141,7 +160,11 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
     };
 
     const sendMessage = async (text: string, nextMode: AssistantMode, history: CanvasAssistantMessage[], savedReferences?: CanvasAssistantReference[]) => {
-        const requestConfig = { ...effectiveConfig, count: nextMode === "image" ? effectiveConfig.canvasImageCount || effectiveConfig.count : effectiveConfig.count, model: nextMode === "image" ? effectiveConfig.imageModel || effectiveConfig.model : effectiveConfig.textModel || effectiveConfig.model };
+        const requestConfig = {
+            ...effectiveConfig,
+            count: nextMode === "image" ? effectiveConfig.canvasImageCount || effectiveConfig.count : effectiveConfig.count,
+            model: assistantModelFor(effectiveConfig, nextMode),
+        };
         if (!isAiConfigReady(requestConfig, requestConfig.model)) {
             openConfigDialog(true);
             return;
@@ -157,7 +180,7 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
         const userMessage: CanvasAssistantMessage = { id: nanoid(), role: "user", mode: nextMode, text, references: refs };
         const assistantId = nanoid();
         appendMessage(session.id, userMessage);
-        appendMessage(session.id, { id: assistantId, role: "assistant", mode: nextMode, text: nextMode === "image" ? "正在生成图片" : "正在回答", isLoading: true });
+        appendMessage(session.id, { id: assistantId, role: "assistant", mode: nextMode, text: "", isLoading: true });
         setPrompt("");
         setIsRunning(true);
 
@@ -176,15 +199,95 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
                 return;
             }
 
-            const answer = await requestImageQuestion(requestConfig, await buildChatMessages([...history, userMessage]), (streamed) => {
+            if (nextMode === "video") {
+                const referenceImages: ReferenceImage[] = await Promise.all(
+                    refs.filter((item) => item.dataUrl).map(async (item) => ({ id: item.id, name: `${item.title}.png`, type: "image/png", dataUrl: await imageToDataUrl(item), storageKey: item.storageKey })),
+                );
+                const result = await requestVideoGeneration(requestConfig, text, referenceImages);
+                const stored = await storeGeneratedVideo(result);
+                updateMessage(session.id, assistantId, {
+                    text: "已生成视频",
+                    videos: [{ id: nanoid(), url: stored.url, storageKey: stored.storageKey, mimeType: stored.mimeType, prompt: text }],
+                    isLoading: false,
+                });
+                return;
+            }
+
+            if (nextMode === "audio") {
+                const blob = await requestAudioGeneration(requestConfig, text);
+                const stored = await storeGeneratedAudio(blob, requestConfig.audioFormat);
+                updateMessage(session.id, assistantId, {
+                    text: "已生成音频",
+                    audios: [{ id: nanoid(), url: stored.url, storageKey: stored.storageKey, mimeType: stored.mimeType, prompt: text }],
+                    isLoading: false,
+                });
+                return;
+            }
+
+            const chatMessages = await buildChatMessages([...history, userMessage]);
+            const summary = buildCanvasSummary(nodes, connections, selectedNodeIds);
+            const messagesWithContext: ChatCompletionMessage[] = summary ? [{ role: "system", content: summary }, ...chatMessages] : chatMessages;
+
+            if (agentEnabled) {
+                await runAgentLoop(session.id, assistantId, requestConfig, messagesWithContext);
+                return;
+            }
+
+            const answer = await requestImageQuestion(requestConfig, messagesWithContext, (streamed) => {
                 updateMessage(session.id, assistantId, { text: streamed, isLoading: false });
             });
             updateMessage(session.id, assistantId, { text: answer, isLoading: false });
         } catch (error) {
-            updateMessage(session.id, assistantId, { text: error instanceof Error ? error.message : "操作失败", isLoading: false });
+            updateMessage(session.id, assistantId, { text: error instanceof Error ? error.message : "操作失败", isLoading: false, isError: true });
         } finally {
             setIsRunning(false);
         }
+    };
+
+    const runAgentLoop = async (sessionId: string, assistantId: string, requestConfig: AiConfig, baseMessages: ChatCompletionMessage[]) => {
+        const conversation: ChatCompletionMessage[] = [...baseMessages];
+        const toolCallEntries: CanvasAssistantToolCallEntry[] = [];
+        let finalText = "";
+
+        for (let round = 0; round < AGENT_MAX_ROUNDS; round += 1) {
+            const turn = await requestChatTurn(requestConfig, conversation, ASSISTANT_TOOL_SCHEMAS);
+            const calls = turn.tool_calls || [];
+            if (!calls.length) {
+                finalText = turn.text || finalText;
+                updateMessage(sessionId, assistantId, { text: finalText || "（已完成）", toolCalls: [...toolCallEntries], isLoading: false });
+                return;
+            }
+
+            // Re-emit a stable short-id map view to the model after every round
+            // so it can plan further actions against the latest canvas state.
+            conversation.push({ role: "assistant", content: turn.text || null, tool_calls: calls });
+
+            for (const call of calls) {
+                let parsedArgs: Record<string, unknown> = {};
+                try {
+                    parsedArgs = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+                } catch {
+                    parsedArgs = {};
+                }
+                const entry: CanvasAssistantToolCallEntry = { id: call.id, name: call.function.name, args: parsedArgs };
+                toolCallEntries.push(entry);
+                updateMessage(sessionId, assistantId, { text: finalText, toolCalls: [...toolCallEntries], isLoading: true });
+
+                const result = await executeAssistantTool({ id: call.id, name: call.function.name, args: parsedArgs }, toolDispatcher);
+                entry.result = { ok: result.ok, summary: result.summary };
+                updateMessage(sessionId, assistantId, { text: finalText, toolCalls: [...toolCallEntries], isLoading: true });
+
+                conversation.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result.data ? { ok: result.ok, summary: result.summary, ...(result.data as object) } : { ok: result.ok, summary: result.summary }) });
+            }
+        }
+
+        // Hit the round budget without a final answer
+        updateMessage(sessionId, assistantId, {
+            text: finalText || "任务过长，已达到工具调用轮次上限，请拆解为更小的步骤后再试。",
+            toolCalls: [...toolCallEntries],
+            isLoading: false,
+            isError: !finalText,
+        });
     };
 
     const submit = async () => {
@@ -241,7 +344,7 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
                 <div className="flex items-center justify-between border-b px-4 py-3" style={{ borderColor: theme.node.stroke }}>
                     <div className="flex items-center gap-2 text-sm font-medium">
                         <Sparkles className="size-4" />
-                        {view === "history" ? "历史记录" : "画布助手(未开发)"}
+                        {view === "history" ? "历史记录" : "画布助手"}
                     </div>
                     <div className="flex items-center gap-1">
                         {view === "history" ? (
@@ -302,7 +405,7 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
                             onDelete={(id) => setDeleteChatIds([id])}
                         />
                     ) : messages.length ? (
-                        <AssistantMessages messages={messages} onRetry={retryMessage} onInsertImage={onInsertImage} onInsertText={onInsertText} />
+                        <AssistantMessages messages={messages} onRetry={retryMessage} onInsertImage={onInsertImage} onInsertText={onInsertText} onInsertVideo={onInsertVideo} onInsertAudio={onInsertAudio} />
                     ) : (
                         <div className="flex h-full flex-col items-center justify-center px-1 text-center">
                             <div className="relative font-serif text-4xl font-bold italic tracking-normal" style={{ color: theme.node.text }}>
@@ -320,8 +423,11 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
                         prompt={prompt}
                         isRunning={isRunning}
                         references={selectedReferences}
+                        unsupportedReferenceCount={unsupportedReferenceCount}
                         config={assistantConfig}
                         onModeChange={setMode}
+                        agentEnabled={agentEnabled}
+                        onAgentToggle={setAgentEnabled}
                         onPromptChange={setPrompt}
                         onSubmit={submit}
                         onConfigChange={(key, value) => updateConfig(key === "count" ? "canvasImageCount" : key, value)}
@@ -368,7 +474,10 @@ function AssistantComposer({
     prompt,
     isRunning,
     references,
+    unsupportedReferenceCount,
     config,
+    agentEnabled,
+    onAgentToggle,
     onModeChange,
     onPromptChange,
     onSubmit,
@@ -382,7 +491,10 @@ function AssistantComposer({
     prompt: string;
     isRunning: boolean;
     references: CanvasAssistantReference[];
+    unsupportedReferenceCount: number;
     config: AiConfig;
+    agentEnabled: boolean;
+    onAgentToggle: (enabled: boolean) => void;
     onModeChange: (mode: AssistantMode) => void;
     onPromptChange: (prompt: string) => void;
     onSubmit: () => void;
@@ -393,7 +505,7 @@ function AssistantComposer({
     modelCosts?: { model: string; credits: number }[];
 }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
-    const activeModel = mode === "image" ? config.imageModel || config.model : config.textModel || config.model;
+    const activeModel = assistantModelFor(config, mode);
     const credits = requestCreditCost({ channelMode: config.channelMode, modelCosts, model: activeModel, count: mode === "image" ? config.count : 1 });
 
     return (
@@ -403,6 +515,11 @@ function AssistantComposer({
                     {references.map((item, index) => (
                         <AssistantReferenceChip key={item.id} item={item} label={assistantImageReferenceLabel(references, index)} onRemove={() => onRemoveReference(item.id)} />
                     ))}
+                </div>
+            ) : null}
+            {unsupportedReferenceCount ? (
+                <div className="mb-1.5 px-1 text-xs opacity-60" style={{ color: theme.node.muted }}>
+                    {`已忽略 ${unsupportedReferenceCount} 个视频/音频节点（暂不支持作为参考）`}
                 </div>
             ) : null}
             <div className="rounded-[28px] border px-3 pb-3 pt-3 shadow-lg" style={{ background: theme.toolbar.panel, borderColor: theme.node.stroke }}>
@@ -422,7 +539,7 @@ function AssistantComposer({
                     }}
                     className="thin-scrollbar h-20 w-full resize-none border-0 bg-transparent px-1 py-1 text-sm leading-5 outline-none placeholder:text-stone-400"
                     style={{ color: theme.node.text }}
-                    placeholder={mode === "image" ? "描述你想生成或修改的图片" : "输入你想问的问题"}
+                    placeholder={composerPlaceholder(mode, references.length > 0)}
                 />
                 <div className="mt-2 flex items-center justify-between gap-2">
                     <div className="canvas-composer-tools flex min-w-0 flex-1 items-center gap-1">
@@ -433,8 +550,26 @@ function AssistantComposer({
                                 <ModelPicker className="h-8 shrink-0" config={config} value={config.imageModel || config.model} onChange={(model) => onConfigChange("imageModel", model)} capability="image" onMissingConfig={onMissingConfig} />
                                 <CanvasImageSettingsPopover config={config} placement="topRight" getPopupContainer={() => document.body} buttonClassName="canvas-composer-settings canvas-composer-icon !h-8 !min-w-8 !rounded-full !px-2" onConfigChange={onConfigChange} onMissingConfig={onMissingConfig} />
                             </>
+                        ) : mode === "video" ? (
+                            <ModelPicker className="h-8 shrink-0" config={config} value={config.videoModel || config.model} onChange={(model) => onConfigChange("videoModel", model)} capability="video" onMissingConfig={onMissingConfig} />
+                        ) : mode === "audio" ? (
+                            <ModelPicker className="h-8 shrink-0" config={config} value={config.audioModel || config.model} onChange={(model) => onConfigChange("audioModel", model)} capability="audio" onMissingConfig={onMissingConfig} />
                         ) : (
-                            <ModelPicker className="h-8 shrink-0" config={config} value={config.textModel || config.model} onChange={(model) => onConfigChange("textModel", model)} capability="text" onMissingConfig={onMissingConfig} />
+                            <>
+                                <ModelPicker className="h-8 shrink-0" config={config} value={config.textModel || config.model} onChange={(model) => onConfigChange("textModel", model)} capability="text" onMissingConfig={onMissingConfig} />
+                                <Tooltip title={agentEnabled ? "Agent 模式：助手可主动操作画布（点击关闭）" : "纯回答模式（点击启用 Agent）"}>
+                                    <button
+                                        type="button"
+                                        className="flex h-8 shrink-0 items-center gap-1 rounded-full border-0 bg-transparent px-2 text-xs transition"
+                                        style={{ background: agentEnabled ? theme.node.activeStroke : theme.node.fill, color: agentEnabled ? theme.node.panel : theme.node.text }}
+                                        onClick={() => onAgentToggle(!agentEnabled)}
+                                        aria-label="Agent 模式开关"
+                                    >
+                                        <Zap className="size-3.5" />
+                                        Agent
+                                    </button>
+                                </Tooltip>
+                            </>
                         )}
                     </div>
                     <Button
@@ -464,6 +599,8 @@ function AssistantModeSwitch({ mode, theme, onChange }: { mode: AssistantMode; t
             {[
                 { value: "ask" as const, title: "对话", icon: <MessageSquare className="size-4" /> },
                 { value: "image" as const, title: "生图", icon: <ImageIcon className="size-4" /> },
+                { value: "video" as const, title: "视频", icon: <Video className="size-4" /> },
+                { value: "audio" as const, title: "音频", icon: <Music2 className="size-4" /> },
             ].map((item) => (
                 <Tooltip key={item.value} title={item.title}>
                     <button
@@ -499,11 +636,15 @@ function AssistantMessages({
     onRetry,
     onInsertImage,
     onInsertText,
+    onInsertVideo,
+    onInsertAudio,
 }: {
     messages: CanvasAssistantMessage[];
     onRetry: (message: CanvasAssistantMessage) => void;
     onInsertImage: (image: CanvasAssistantImage) => void;
     onInsertText: (text: string) => void;
+    onInsertVideo: (video: CanvasAssistantVideo) => void;
+    onInsertAudio: (audio: CanvasAssistantAudio) => void;
 }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
 
@@ -511,24 +652,59 @@ function AssistantMessages({
         <>
             {messages.map((message) => (
                 <div key={message.id} className={cn("flex flex-col gap-2", message.role === "user" ? "items-end" : "items-start")}>
-                    <div
-                        className="max-w-[88%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm leading-6"
-                        style={message.role === "user" ? { background: theme.toolbar.activeBg, color: theme.toolbar.activeText } : { background: theme.node.fill, color: theme.node.text }}
-                    >
-                        {message.role === "assistant" ? (
-                            <div className="mb-1 flex items-center gap-1.5 text-xs opacity-60">
-                                <MessageSquare className="size-3.5" />
-                                回答
-                            </div>
-                        ) : null}
-                        {message.text}
-                    </div>
+                    {!message.isLoading || message.role === "user" ? (
+                        <div
+                            className={cn("max-w-[88%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm leading-6", message.isError ? "border" : null)}
+                            style={
+                                message.isError
+                                    ? { background: "rgba(220, 38, 38, 0.08)", borderColor: "rgba(220, 38, 38, 0.35)", color: "rgb(185, 28, 28)" }
+                                    : message.role === "user"
+                                      ? { background: theme.toolbar.activeBg, color: theme.toolbar.activeText }
+                                      : { background: theme.node.fill, color: theme.node.text }
+                            }
+                        >
+                            {message.role === "assistant" ? (
+                                <div className="mb-1 flex items-center gap-1.5 text-xs opacity-70">
+                                    {message.isError ? (
+                                        <>
+                                            <X className="size-3.5" />
+                                            出错
+                                        </>
+                                    ) : message.mode === "image" ? (
+                                        <>
+                                            <ImageIcon className="size-3.5" />
+                                            生图
+                                        </>
+                                    ) : message.mode === "video" ? (
+                                        <>
+                                            <Video className="size-3.5" />
+                                            视频
+                                        </>
+                                    ) : message.mode === "audio" ? (
+                                        <>
+                                            <Music2 className="size-3.5" />
+                                            音频
+                                        </>
+                                    ) : (
+                                        <>
+                                            <MessageSquare className="size-3.5" />
+                                            回答
+                                        </>
+                                    )}
+                                </div>
+                            ) : null}
+                            {message.text || (message.isError ? "操作失败" : "")}
+                        </div>
+                    ) : null}
                     {message.references?.length ? <MessageReferences message={message} /> : null}
-                    {message.isLoading ? <ImageGenerationPending compact label={message.mode === "image" ? "正在生成图片" : "正在回答"} className="w-[250px] rounded-2xl border" /> : null}
+                    {message.toolCalls?.length ? <MessageToolCalls toolCalls={message.toolCalls} /> : null}
+                    {message.isLoading ? <ImageGenerationPending compact label={loadingLabel(message.mode)} className="w-[250px] rounded-2xl border" /> : null}
                     {message.role === "assistant" && !message.isLoading ? (
                         <div className="flex gap-1">
                             <Button shape="circle" size="small" style={{ borderColor: theme.node.stroke }} icon={<RotateCcw className="size-3.5" />} onClick={() => onRetry(message)} title="重试" />
-                            {!message.images?.length ? <Button shape="circle" size="small" style={{ borderColor: theme.node.stroke }} icon={<Plus className="size-3.5" />} onClick={() => onInsertText(message.text)} title="插入画布" /> : null}
+                            {!message.isError && !message.images?.length && !message.videos?.length && !message.audios?.length ? (
+                                <Button shape="circle" size="small" style={{ borderColor: theme.node.stroke }} icon={<Plus className="size-3.5" />} onClick={() => onInsertText(message.text)} title="插入画布" />
+                            ) : null}
                         </div>
                     ) : null}
                     {message.images?.map((image) => (
@@ -544,10 +720,43 @@ function AssistantMessages({
                             />
                         </div>
                     ))}
+                    {message.videos?.map((video) => (
+                        <div key={video.id} className="w-[250px] overflow-hidden rounded-2xl border" style={{ background: theme.node.panel, borderColor: theme.node.stroke }}>
+                            <video src={video.url} controls className="aspect-video w-full bg-black object-contain" preload="metadata" />
+                            <Button
+                                type="text"
+                                className="!h-8 !w-full !rounded-none"
+                                style={{ borderTop: `1px solid ${theme.node.stroke}`, color: theme.node.text }}
+                                icon={<Plus className="size-3.5" />}
+                                onClick={() => onInsertVideo(video)}
+                                title="插入画布"
+                            />
+                        </div>
+                    ))}
+                    {message.audios?.map((audio) => (
+                        <div key={audio.id} className="w-[250px] overflow-hidden rounded-2xl border" style={{ background: theme.node.panel, borderColor: theme.node.stroke }}>
+                            <audio src={audio.url} controls className="block w-full px-2 py-2" preload="metadata" />
+                            <Button
+                                type="text"
+                                className="!h-8 !w-full !rounded-none"
+                                style={{ borderTop: `1px solid ${theme.node.stroke}`, color: theme.node.text }}
+                                icon={<Plus className="size-3.5" />}
+                                onClick={() => onInsertAudio(audio)}
+                                title="插入画布"
+                            />
+                        </div>
+                    ))}
                 </div>
             ))}
         </>
     );
+}
+
+function loadingLabel(mode: CanvasAssistantMessage["mode"]): string {
+    if (mode === "image") return "正在生成图片";
+    if (mode === "video") return "正在生成视频，可能需要数分钟";
+    if (mode === "audio") return "正在合成音频";
+    return "正在回答";
 }
 
 function AssistantHistory({
@@ -589,6 +798,48 @@ function MessageReferences({ message }: { message: CanvasAssistantMessage }) {
             {message.references?.map((item, index, references) => (
                 <AssistantReferenceChip key={item.id} item={item} label={assistantImageReferenceLabel(references, index)} />
             ))}
+        </div>
+    );
+}
+
+const TOOL_CALL_LABELS: Record<string, string> = {
+    get_canvas_summary: "读取画布概览",
+    select_nodes: "选中节点",
+    get_node_details: "读取节点详情",
+    add_text_node: "添加文本节点",
+    add_connection: "添加连线",
+    delete_nodes: "删除节点",
+    arrange_layout: "调整布局",
+    update_node_prompt: "更新节点 prompt",
+};
+
+function MessageToolCalls({ toolCalls }: { toolCalls: NonNullable<CanvasAssistantMessage["toolCalls"]> }) {
+    const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    return (
+        <div className="flex max-w-[88%] flex-col gap-1.5">
+            {toolCalls.map((entry) => {
+                const label = TOOL_CALL_LABELS[entry.name] || entry.name;
+                const status = entry.result ? (entry.result.ok ? "done" : "fail") : "running";
+                const summary = entry.result?.summary || (status === "running" ? "执行中…" : "");
+                return (
+                    <div
+                        key={entry.id}
+                        className="rounded-xl border px-3 py-2 text-xs"
+                        style={{
+                            background: status === "fail" ? "rgba(220, 38, 38, 0.08)" : theme.node.fill,
+                            borderColor: status === "fail" ? "rgba(220, 38, 38, 0.35)" : theme.node.stroke,
+                            color: status === "fail" ? "rgb(185, 28, 28)" : theme.node.text,
+                        }}
+                    >
+                        <div className="flex items-center gap-1.5 font-medium">
+                            <Wrench className="size-3.5" />
+                            <span>{label}</span>
+                            {status === "running" ? <LoaderCircle className="size-3 animate-spin" /> : null}
+                        </div>
+                        {summary ? <div className="mt-1 opacity-70">{summary}</div> : null}
+                    </div>
+                );
+            })}
         </div>
     );
 }
@@ -646,6 +897,26 @@ function buildAssistantReferences(nodes: CanvasNodeData[], selectedNodeIds: Set<
         .filter((node): node is CanvasNodeData => Boolean(node))
         .map(nodeToReference)
         .filter((item): item is CanvasAssistantReference => Boolean(item));
+}
+
+function assistantModelFor(config: AiConfig, mode: AssistantMode): string {
+    switch (mode) {
+        case "image":
+            return config.imageModel || config.model;
+        case "video":
+            return config.videoModel || config.model;
+        case "audio":
+            return config.audioModel || config.model;
+        default:
+            return config.textModel || config.model;
+    }
+}
+
+function composerPlaceholder(mode: AssistantMode, hasReferences: boolean): string {
+    if (mode === "image") return hasReferences ? "描述要在选中图片上做的修改" : "描述要生成的图片";
+    if (mode === "video") return hasReferences ? "描述基于选中图片要生成的视频" : "描述要生成的视频";
+    if (mode === "audio") return "输入要朗读 / 合成的音频文本";
+    return hasReferences ? "围绕选中节点提问，或解读这些图片" : "提问，或问一些关于画布的问题";
 }
 
 async function buildChatMessages(messages: CanvasAssistantMessage[]): Promise<ChatCompletionMessage[]> {

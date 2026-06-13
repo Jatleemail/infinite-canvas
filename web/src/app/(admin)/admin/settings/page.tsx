@@ -33,6 +33,7 @@ const emptySettings: AdminSettings = {
             defaultImageModel: "",
             defaultVideoModel: "",
             defaultTextModel: "",
+            defaultAudioModel: "",
             systemPrompt: "",
             allowCustomChannel: true,
         },
@@ -438,6 +439,11 @@ export default function AdminSettingsPage() {
                                             <Select showSearch allowClear options={publicModels.map((item) => ({ label: item, value: item }))} />
                                         </Form.Item>
                                     </Col>
+                                    <Col xs={24} md={6}>
+                                        <Form.Item name={["public", "modelChannel", "defaultAudioModel"]} label="默认音频模型" extra="所有用户在画布音频节点未指定模型时使用，例如 vidu-audio-tts">
+                                            <Select showSearch allowClear options={publicModels.map((item) => ({ label: item, value: item }))} />
+                                        </Form.Item>
+                                    </Col>
                                     <Col span={24}>
                                         <Form.Item name={["public", "modelChannel", "systemPrompt"]} label="系统提示词">
                                             <Input.TextArea rows={4} />
@@ -467,15 +473,19 @@ export default function AdminSettingsPage() {
                                                     dataIndex: "credits",
                                                     width: 220,
                                                     render: (_, item) => (
-                                                        <InputNumber
-                                                            min={0}
-                                                            step={1}
-                                                            precision={0}
-                                                            className="!w-full"
-                                                            value={item.credits}
-                                                            addonAfter="点"
-                                                            onChange={(value) => setModelCost(form, setModelCosts, item.model, Number(value) || 0)}
-                                                        />
+                                                        <Space.Compact className="!w-full">
+                                                            <InputNumber
+                                                                min={0}
+                                                                step={1}
+                                                                precision={0}
+                                                                className="!w-full"
+                                                                value={item.credits}
+                                                                onChange={(value) => setModelCost(form, setModelCosts, item.model, Number(value) || 0)}
+                                                            />
+                                                            <Button disabled tabIndex={-1}>
+                                                                点
+                                                            </Button>
+                                                        </Space.Compact>
                                                     ),
                                                 },
                                             ]}
@@ -557,7 +567,7 @@ export default function AdminSettingsPage() {
                                     dataSource={channelTableData}
                                     columns={[
                                         { title: "名称", dataIndex: "name", render: (value) => value || "未命名渠道" },
-                                        { title: "协议", dataIndex: "protocol", width: 96, render: (value) => <Tag>{value || "openai"}</Tag> },
+                                        { title: "协议", dataIndex: "protocol", width: 96, render: (value) => <Tag color={value === "vidu" ? "purple" : undefined}>{value || "openai"}</Tag> },
                                         { title: "状态", dataIndex: "enabled", width: 96, render: (value) => <Tag color={value ? "success" : "default"}>{value ? "已启用" : "已停用"}</Tag> },
                                         {
                                             title: "模型",
@@ -636,8 +646,13 @@ export default function AdminSettingsPage() {
                                 </Form.Item>
                             </Col>
                             <Col span={12}>
-                                <Form.Item name="protocol" label="协议">
-                                    <Select options={[{ label: "OpenAI", value: "openai" }]} />
+                                <Form.Item name="protocol" label="协议" extra="Vidu 协议覆盖 /ent/v2/reference2image 生图、/ent/v2/img2video|multiframe 视频和 /ent/v2/audio-tts 语音合成。">
+                                    <Select
+                                        options={[
+                                            { label: "OpenAI", value: "openai" },
+                                            { label: "Vidu", value: "vidu" },
+                                        ]}
+                                    />
                                 </Form.Item>
                             </Col>
                             <Col span={12}>
@@ -651,7 +666,7 @@ export default function AdminSettingsPage() {
                                 </Form.Item>
                             </Col>
                             <Col span={24}>
-                                <Form.Item name="baseUrl" label="接口地址" rules={[{ required: true, message: "请输入接口地址" }]}>
+                                <Form.Item name="baseUrl" label="接口地址" rules={[{ required: true, message: "请输入接口地址" }]} extra="OpenAI 协议示例：https://api.openai.com；Vidu 协议示例：https://api.vidu.cn">
                                     <Input />
                                 </Form.Item>
                             </Col>
@@ -871,7 +886,7 @@ function normalizePrivateSetting(setting: Partial<AdminSettings["private"]> = {}
 
 function normalizeChannel(item: Partial<AdminModelChannel> = {}): AdminModelChannel {
     return {
-        protocol: "openai",
+        protocol: item.protocol === "vidu" ? "vidu" : "openai",
         name: item.name || "",
         baseUrl: item.baseUrl || "",
         apiKey: item.apiKey || "",

@@ -48,6 +48,9 @@ func AdminChannelModels(index *int, channel model.ModelChannel) ([]string, error
 	if err != nil {
 		return nil, err
 	}
+	if strings.EqualFold(resolved.Protocol, ViduProtocol) {
+		return nil, safeMessageError{message: "Vidu 渠道暂不提供模型列表接口，请手动填写 viduq2 等模型名称。"}
+	}
 	return fetchAdminChannelModels(resolved)
 }
 
@@ -55,6 +58,9 @@ func AdminTestChannelModel(index *int, channel model.ModelChannel, modelName str
 	resolved, err := resolveAdminChannel(index, channel)
 	if err != nil {
 		return "", err
+	}
+	if strings.EqualFold(resolved.Protocol, ViduProtocol) {
+		return testViduChannel(resolved, modelName)
 	}
 	if isArkAgentPlanChannel(resolved) || isSeedanceModelName(modelName) {
 		return testArkSeedanceChannelModel(resolved, modelName)
@@ -102,6 +108,7 @@ func normalizePublicSettingWithChannels(setting model.PublicSetting, channels []
 	setting.ModelChannel.DefaultTextModel = repairDefaultModel(setting.ModelChannel.DefaultTextModel, setting.ModelChannel.AvailableModels, isTextModelName)
 	setting.ModelChannel.DefaultImageModel = repairDefaultModel(setting.ModelChannel.DefaultImageModel, setting.ModelChannel.AvailableModels, isImageModelName)
 	setting.ModelChannel.DefaultVideoModel = repairDefaultModel(setting.ModelChannel.DefaultVideoModel, setting.ModelChannel.AvailableModels, isVideoModelName)
+	setting.ModelChannel.DefaultAudioModel = repairDefaultModel(setting.ModelChannel.DefaultAudioModel, setting.ModelChannel.AvailableModels, isAudioModelName)
 	setting.ModelChannel.DefaultModel = repairDefaultModel(setting.ModelChannel.DefaultModel, setting.ModelChannel.AvailableModels, isTextModelName)
 	return setting
 }
@@ -283,16 +290,47 @@ func repairDefaultModel(current string, models []string, preferred func(string) 
 
 func isVideoModelName(modelName string) bool {
 	name := strings.ToLower(strings.TrimSpace(modelName))
-	return strings.Contains(name, "seedance") || strings.Contains(name, "video")
+	if isAudioModelName(name) {
+		return false
+	}
+	if strings.Contains(name, "seedance") || strings.Contains(name, "video") {
+		return true
+	}
+	if strings.HasPrefix(name, "viduq3") {
+		return true
+	}
+	if name == "viduq2-pro" || name == "viduq2-turbo" || name == "viduq2-pro-fast" {
+		return true
+	}
+	if name == "viduq1" || name == "viduq1-classic" || name == "vidu2.0" {
+		return true
+	}
+	return false
 }
 
 func isImageModelName(modelName string) bool {
 	name := strings.ToLower(strings.TrimSpace(modelName))
-	return strings.Contains(name, "seedream") || strings.Contains(name, "gpt-image") || strings.Contains(name, "image")
+	if isAudioModelName(name) {
+		return false
+	}
+	if isVideoModelName(name) {
+		return false
+	}
+	return strings.Contains(name, "seedream") || strings.Contains(name, "gpt-image") || strings.Contains(name, "image") || strings.HasPrefix(name, "vidu")
+}
+
+func isAudioModelName(modelName string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	return strings.Contains(name, "tts") ||
+		strings.Contains(name, "speech") ||
+		strings.Contains(name, "voice") ||
+		strings.Contains(name, "audio") ||
+		strings.Contains(name, "music") ||
+		strings.Contains(name, "sound")
 }
 
 func isTextModelName(modelName string) bool {
-	return !isImageModelName(modelName) && !isVideoModelName(modelName)
+	return !isImageModelName(modelName) && !isVideoModelName(modelName) && !isAudioModelName(modelName)
 }
 
 func normalizeModelChannel(channel model.ModelChannel) model.ModelChannel {

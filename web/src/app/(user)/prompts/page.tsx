@@ -15,6 +15,7 @@ import { ALL_PROMPTS_OPTION, type Prompt } from "@/services/api/prompts";
 export default function PromptsPage() {
     const { message } = App.useApp();
     const [titleKeyword, setTitleKeyword] = useState("");
+    const [keywordInput, setKeywordInput] = useState("");
     const [selectedTags, setSelectedTags] = useState<string[]>([]);
     const [selectedCategory, setSelectedCategory] = useState(ALL_PROMPTS_OPTION);
     const [selectedPrompt, setSelectedPrompt] = useState<Prompt | null>(null);
@@ -64,7 +65,17 @@ export default function PromptsPage() {
                     {!query.isLoading ? (
                         <>
                             <div className="mx-auto mt-8 w-full max-w-2xl">
-                                <Input size="large" className="w-full" prefix={<Search className="size-4 text-stone-400" />} value={titleKeyword} placeholder="按标题查询" onChange={(event) => setTitleKeyword(event.target.value)} />
+                                <Input.Search
+                                    size="large"
+                                    className="w-full"
+                                    prefix={<Search className="size-4 text-stone-400" />}
+                                    value={keywordInput}
+                                    placeholder="按标题查询，回车搜索"
+                                    allowClear
+                                    enterButton={false}
+                                    onChange={(event) => setKeywordInput(event.target.value)}
+                                    onSearch={(value) => setTitleKeyword(value)}
+                                />
                             </div>
                             <div className="mx-auto mt-6 grid max-w-6xl gap-3 text-left">
                                 <div className="grid gap-2 sm:grid-cols-[56px_minmax(0,1fr)] sm:items-start">

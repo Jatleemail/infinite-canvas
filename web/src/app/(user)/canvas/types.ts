@@ -90,14 +90,41 @@ export type CanvasAssistantImage = {
     prompt: string;
 };
 
+export type CanvasAssistantVideo = {
+    id: string;
+    url: string;
+    storageKey?: string;
+    mimeType?: string;
+    prompt: string;
+};
+
+export type CanvasAssistantAudio = {
+    id: string;
+    url: string;
+    storageKey?: string;
+    mimeType?: string;
+    prompt: string;
+};
+
+export type CanvasAssistantToolCallEntry = {
+    id: string;
+    name: string;
+    args: Record<string, unknown>;
+    result?: { ok: boolean; summary: string };
+};
+
 export type CanvasAssistantMessage = {
     id: string;
     role: "user" | "assistant";
-    mode: "ask" | "image";
+    mode: "ask" | "image" | "video" | "audio";
     text: string;
     isLoading?: boolean;
+    isError?: boolean;
     references?: CanvasAssistantReference[];
     images?: CanvasAssistantImage[];
+    videos?: CanvasAssistantVideo[];
+    audios?: CanvasAssistantAudio[];
+    toolCalls?: CanvasAssistantToolCallEntry[];
 };
 
 export type CanvasAssistantSession = {
