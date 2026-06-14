@@ -8,3 +8,6 @@ data/
 *.tsbuildinfo
 .DS_Store
 .idea
+.vscode/
+.codegraph/
+__debug_bin*
