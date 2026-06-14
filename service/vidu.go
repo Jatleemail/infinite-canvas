@@ -25,6 +25,7 @@ const (
 	viduGenerateImagePath = "/ent/v2/reference2image"
 	viduTaskListPath      = "/ent/v2/tasks"
 	viduAudioTTSPath      = "/ent/v2/audio-tts"
+	viduAudioClonePath    = "/ent/v2/audio-clone"
 	viduPollInterval      = 3 * time.Second
 	viduPollTimeout       = 180 * time.Second
 	viduAudioPollInterval = 2 * time.Second
@@ -861,4 +862,192 @@ func normalizeViduAudioEmotion(value string) string {
 		return strings.ToLower(strings.TrimSpace(value))
 	}
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Vidu 声音复刻（audio-clone）
+// ---------------------------------------------------------------------------
+//
+// Vidu 的声音复刻接口（POST /ent/v2/audio-clone）需要一段公网可访问的样本音频
+// (audio_url) 以及用户自定义的 voice_id，请求成功后返回一个临时音色，并附带一段
+// 试听音频链接（demo_audio）。复刻出来的音色在 7 天内若未被 audio-tts 调用就会
+// 被 Vidu 端销毁；本服务层只负责把一次复刻请求同步跑完，过期管理留给前端。
+//
+// 接口语义上是同步的，但 Vidu 也允许返回 queueing；这里复用现有 fetchViduTask
+// 短轮询，把同步语义封死，最长等待 60s。
+
+// ViduVoiceCloneRequest 描述一次声音复刻调用的入参。
+//
+//   - AudioURL：公网可访问的样本音频 URL（mp3/m4a/wav；10s ≤ 时长 ≤ 5min；≤ 20MB）。
+//   - VoiceID：用户自定义的 voice_id；长度 [8,256]，首字符英文字母，允许 0-9 a-z A-Z _ -，
+//     末位不可是 - _ *；不可与已有 voice_id 重复。校验由前端先行做格式拦截；这里只检查空。
+//   - PromptAudioURL / PromptText：可选的示例音频和文本，用于增强复刻相似度。
+//   - Text：试听文本，1000 字以内，模型会用复刻后的音色朗读并返回 demo_audio。
+//   - Payload：透传字段，原样返回，用于前端关联请求。
+type ViduVoiceCloneRequest struct {
+	AudioURL       string
+	VoiceID        string
+	PromptAudioURL string
+	PromptText     string
+	Text           string
+	Payload        string
+}
+
+// ViduVoiceCloneResult 描述一次声音复刻调用的产物。
+//
+//   - VoiceID：成功时回显用户传入的 voice_id（失败时 Vidu 不返回，这里也会是空）。
+//   - DemoAudioURL：试听音频的临时链接，用于前端直接播放或自行下载缓存。
+//   - TaskID / State / Payload / CreatedAt：与 Vidu 响应一一对应，便于前端展示与排错。
+type ViduVoiceCloneResult struct {
+	TaskID       string
+	State        string
+	VoiceID      string
+	DemoAudioURL string
+	Payload      string
+	CreatedAt    string
+}
+
+type viduVoiceCloneRequestBody struct {
+	AudioURL       string `json:"audio_url"`
+	VoiceID        string `json:"voice_id"`
+	PromptAudioURL string `json:"prompt_audio_url,omitempty"`
+	PromptText     string `json:"prompt_text,omitempty"`
+	Text           string `json:"text"`
+	Payload        string `json:"payload,omitempty"`
+}
+
+type viduVoiceCloneResponse struct {
+	TaskID    string `json:"task_id"`
+	State     string `json:"state"`
+	VoiceID   string `json:"voice_id"`
+	DemoAudio string `json:"demo_audio"`
+	Payload   string `json:"payload"`
+	CreatedAt string `json:"created_at"`
+}
+
+// CloneViduVoice 调用 Vidu /ent/v2/audio-clone 完成一次声音复刻；
+// 同步成功直接返回；queueing 时短轮询任务状态，最终返回试听音频链接和 voice_id。
+func CloneViduVoice(channel model.ModelChannel, request ViduVoiceCloneRequest) (ViduVoiceCloneResult, error) {
+	audioURL := strings.TrimSpace(request.AudioURL)
+	if audioURL == "" {
+		return ViduVoiceCloneResult{}, safeMessageError{message: "请上传用于复刻的音频"}
+	}
+	voiceID := strings.TrimSpace(request.VoiceID)
+	if voiceID == "" {
+		return ViduVoiceCloneResult{}, safeMessageError{message: "请提供自定义的 voice_id"}
+	}
+	text := strings.TrimSpace(request.Text)
+	if text == "" {
+		return ViduVoiceCloneResult{}, safeMessageError{message: "请提供试听文本"}
+	}
+	if len([]rune(text)) > 1000 {
+		return ViduVoiceCloneResult{}, safeMessageError{message: "试听文本不能超过 1000 字符"}
+	}
+	body := viduVoiceCloneRequestBody{
+		AudioURL:       audioURL,
+		VoiceID:        voiceID,
+		PromptAudioURL: strings.TrimSpace(request.PromptAudioURL),
+		PromptText:     strings.TrimSpace(request.PromptText),
+		Text:           text,
+		Payload:        request.Payload,
+	}
+	parsed, err := submitViduVoiceCloneTask(channel, body)
+	if err != nil {
+		return ViduVoiceCloneResult{}, err
+	}
+	state := strings.ToLower(strings.TrimSpace(parsed.State))
+	demoURL := strings.TrimSpace(parsed.DemoAudio)
+	// 同步成功：直接拿 demo_audio + voice_id。
+	if state == "success" {
+		return ViduVoiceCloneResult{
+			TaskID:       parsed.TaskID,
+			State:        parsed.State,
+			VoiceID:      strings.TrimSpace(parsed.VoiceID),
+			DemoAudioURL: demoURL,
+			Payload:      parsed.Payload,
+			CreatedAt:    parsed.CreatedAt,
+		}, nil
+	}
+	if state == "failed" {
+		return ViduVoiceCloneResult{}, safeMessageError{message: "Vidu 声音复刻失败"}
+	}
+	if strings.TrimSpace(parsed.TaskID) == "" {
+		return ViduVoiceCloneResult{}, safeMessageError{message: "Vidu 接口没有返回任务 ID"}
+	}
+	// queueing：复用 fetchViduTask 的短轮询，等出最终态。
+	finalDemoURL, finalVoiceID, err := pollViduVoiceCloneTask(channel, parsed.TaskID, voiceID)
+	if err != nil {
+		return ViduVoiceCloneResult{}, err
+	}
+	return ViduVoiceCloneResult{
+		TaskID:       parsed.TaskID,
+		State:        "success",
+		VoiceID:      finalVoiceID,
+		DemoAudioURL: finalDemoURL,
+		Payload:      parsed.Payload,
+		CreatedAt:    parsed.CreatedAt,
+	}, nil
+}
+
+func submitViduVoiceCloneTask(channel model.ModelChannel, body viduVoiceCloneRequestBody) (viduVoiceCloneResponse, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return viduVoiceCloneResponse{}, err
+	}
+	endpoint, err := buildViduURL(channel, viduAudioClonePath, nil)
+	if err != nil {
+		return viduVoiceCloneResponse{}, err
+	}
+	httpRequest, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return viduVoiceCloneResponse{}, err
+	}
+	httpRequest.Header.Set("Authorization", "Token "+channel.APIKey)
+	httpRequest.Header.Set("Content-Type", "application/json")
+	response, err := viduHTTPClient.Do(httpRequest)
+	if err != nil {
+		return viduVoiceCloneResponse{}, safeMessageError{message: "Vidu 接口请求失败，请稍后重试"}
+	}
+	defer response.Body.Close()
+	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode >= http.StatusBadRequest {
+		return viduVoiceCloneResponse{}, viduUpstreamError(response.StatusCode, responseBody, "Vidu 声音复刻失败")
+	}
+	var parsed viduVoiceCloneResponse
+	if err := json.Unmarshal(responseBody, &parsed); err != nil {
+		return viduVoiceCloneResponse{}, safeMessageError{message: "Vidu 接口返回内容无法解析"}
+	}
+	return parsed, nil
+}
+
+// pollViduVoiceCloneTask 在 Vidu audio-clone 同步返回 queueing 时短轮询任务状态。
+// 注意：fetchViduTask 通用列表接口里只返回 creations[].url，这里把第一个有效 URL
+// 当作 demo_audio_url 返回；voice_id 在轮询接口里拿不到，所以回退到请求时传入的值。
+func pollViduVoiceCloneTask(channel model.ModelChannel, taskID string, requestedVoiceID string) (string, string, error) {
+	deadline := time.Now().Add(viduAudioPollTimeout)
+	for {
+		task, err := fetchViduTask(channel, taskID)
+		if err != nil && !errors.Is(err, errViduTaskNotInList) {
+			return "", "", err
+		}
+		if err == nil {
+			switch strings.ToLower(strings.TrimSpace(task.State)) {
+			case "success":
+				for _, item := range task.Creations {
+					if strings.TrimSpace(item.URL) != "" {
+						return item.URL, requestedVoiceID, nil
+					}
+				}
+				// 任务报告成功但没拿到试听 URL：voice 已经在 Vidu 那边创建出来，
+				// 不应判为整体失败，让上层把 demo_audio 留空，调用方继续使用 voice_id。
+				return "", requestedVoiceID, nil
+			case "failed":
+				return "", "", safeMessageError{message: "Vidu 声音复刻失败"}
+			}
+		}
+		if time.Now().After(deadline) {
+			return "", "", safeMessageError{message: "Vidu 声音复刻超时，请稍后重试"}
+		}
+		time.Sleep(viduAudioPollInterval)
+	}
 }

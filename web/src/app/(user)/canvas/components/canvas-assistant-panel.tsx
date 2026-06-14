@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useParams } from "next/navigation";
 import { ArrowUp, History, ImageIcon, LoaderCircle, MessageSquare, Music2, PanelRightClose, Plus, RotateCcw, Settings2, Sparkles, Trash2, Video, Wrench, X, Zap } from "lucide-react";
 import { Button, Modal, Tooltip } from "antd";
 import { motion } from "motion/react";
@@ -24,6 +25,7 @@ import { DiaTextReveal } from "@/components/ui/dia-text-reveal";
 import { CanvasImageSettingsPopover } from "./canvas-image-settings-popover";
 import { CanvasPromptLibrary } from "./canvas-prompt-library";
 import { buildCanvasSummary } from "../utils/canvas-summary";
+import { touchCustomVoiceIfApplicable } from "../utils/canvas-voice-clone";
 import { ASSISTANT_TOOL_SCHEMAS, executeAssistantTool, type AssistantToolDispatcher } from "../utils/assistant-tools";
 import { CanvasNodeType, type CanvasAssistantAudio, type CanvasAssistantImage, type CanvasAssistantMessage, type CanvasAssistantReference, type CanvasAssistantSession, type CanvasAssistantToolCallEntry, type CanvasAssistantVideo, type CanvasConnection, type CanvasNodeData } from "../types";
 
@@ -32,6 +34,23 @@ type AssistantMode = "ask" | "image" | "video" | "audio";
 const AGENT_MAX_ROUNDS = 6;
 const PANEL_MOTION_MS = 500;
 const PANEL_MOTION_SECONDS = PANEL_MOTION_MS / 1000;
+
+/**
+ * 声音复刻类工具的使用规则；每轮 system 消息都注入，确保助手在长会话里仍然遵循。
+ * 设计原则：
+ *  1. 复刻 = 花钱 + 上传隐私音频，所以助手只能"打开复刻面板"，不能自己 audio_url + voice_id 全帮用户填好然后调 clone 接口。
+ *  2. 朗读（speak_with_voice）允许直接发起，因为它只是消耗少量 TTS 配额、没有版权风险。
+ *  3. voice_id 必须来自 list_custom_voices；不能凭空起一个 voice_id 然后送进 speak_with_voice。
+ */
+const VOICE_TOOLS_SYSTEM_PROMPT = [
+    "声音复刻 / 朗读相关工具使用规则：",
+    "1. 当用户提到\"克隆我的声音\"、\"声音复刻\"、\"用 X 的声音说话\"等需求时：",
+    "   - 先调用 list_custom_voices 看本画布里现有的复刻音色；",
+    "   - 如果有匹配的（label 接近用户描述、且未过期），用 speak_with_voice 直接合成；",
+    "   - 如果没有，调用 open_voice_clone_dialog 把用户引导到复刻对话框，并在回复中说明\"我已经帮你打开复刻面板，请上传一段 10-300 秒的真人录音并确认\"。**不要**自己尝试通过其它工具或参数完成复刻——open_voice_clone_dialog 之外没有任何工具可以让你创建新音色。",
+    "2. speak_with_voice 的 voice_id 必须是 list_custom_voices 返回的 voice_id 之一，或为空字符串（表示用画布默认音色）。**禁止凭空捏造 voice_id**。",
+    "3. 用户没有明确提朗读或复刻时，不要主动调用本组工具。",
+].join("\n");
 
 type CanvasAssistantPanelProps = {
     nodes: CanvasNodeData[];
@@ -53,6 +72,8 @@ type CanvasAssistantPanelProps = {
 
 export function CanvasAssistantPanel({ nodes, connections, selectedNodeIds, sessions, activeSessionId, toolDispatcher, onSelectNodeIds, onSessionsChange, onInsertImage, onInsertText, onInsertVideo, onInsertAudio, onPasteImage, onCollapseStart, onCollapse }: CanvasAssistantPanelProps) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    const params = useParams<{ id?: string }>();
+    const projectId = params?.id || null;
     const effectiveConfig = useEffectiveConfig();
     const modelCosts = useConfigStore((state) => state.publicSettings?.modelChannel.modelCosts);
     const cleanupImages = useAssetStore((state) => state.cleanupImages);
@@ -216,6 +237,7 @@ export function CanvasAssistantPanel({ nodes, connections, selectedNodeIds, sess
             if (nextMode === "audio") {
                 const blob = await requestAudioGeneration(requestConfig, text);
                 const stored = await storeGeneratedAudio(blob, requestConfig.audioFormat);
+                touchCustomVoiceIfApplicable(projectId, requestConfig.audioVoice);
                 updateMessage(session.id, assistantId, {
                     text: "已生成音频",
                     audios: [{ id: nanoid(), url: stored.url, storageKey: stored.storageKey, mimeType: stored.mimeType, prompt: text }],
@@ -226,7 +248,12 @@ export function CanvasAssistantPanel({ nodes, connections, selectedNodeIds, sess
 
             const chatMessages = await buildChatMessages([...history, userMessage]);
             const summary = buildCanvasSummary(nodes, connections, selectedNodeIds);
-            const messagesWithContext: ChatCompletionMessage[] = summary ? [{ role: "system", content: summary }, ...chatMessages] : chatMessages;
+            const systemMessages: ChatCompletionMessage[] = [];
+            if (summary) systemMessages.push({ role: "system", content: summary });
+            // 声音复刻类工具的使用规则。每轮都注入，避免会话长了之后被遗忘；
+            // 内容本身很短（< 200 token），不会显著拉高费用。
+            systemMessages.push({ role: "system", content: VOICE_TOOLS_SYSTEM_PROMPT });
+            const messagesWithContext: ChatCompletionMessage[] = [...systemMessages, ...chatMessages];
 
             if (agentEnabled) {
                 await runAgentLoop(session.id, assistantId, requestConfig, messagesWithContext);

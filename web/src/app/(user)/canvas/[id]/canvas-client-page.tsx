@@ -33,6 +33,10 @@ import { CanvasNodeCropDialog, type CanvasImageCropRect } from "../components/ca
 import { CanvasNodeMaskEditDialog, type CanvasImageMaskEditPayload } from "../components/canvas-node-mask-edit-dialog";
 import { CanvasNodeSplitDialog, type CanvasImageSplitParams } from "../components/canvas-node-split-dialog";
 import { CanvasNodeUpscaleDialog, type CanvasImageUpscaleParams } from "../components/canvas-node-upscale-dialog";
+import { CanvasVoiceCloneDialog } from "../components/canvas-voice-clone-dialog";
+import { touchCustomVoiceIfApplicable } from "../utils/canvas-voice-clone";
+import { useCanvasVoiceCloneStore } from "../stores/use-canvas-voice-clone-store";
+import { isViduAudioModel } from "@/lib/vidu-audio";
 import { buildNodeChatMessages, buildNodeGenerationContext, buildNodeGenerationInputs, hydrateNodeGenerationContext, type NodeGenerationInput } from "../components/canvas-node-generation";
 import { CanvasNodeHoverToolbar, CanvasNodeInfoModal } from "../components/canvas-node-hover-toolbar";
 import { InfiniteCanvas } from "../components/infinite-canvas";
@@ -44,7 +48,7 @@ import { AssetPickerModal, type AssetPickerTab, type InsertAssetPayload } from "
 import { CanvasZoomControls } from "../components/canvas-zoom-controls";
 import { useCanvasStore } from "../stores/use-canvas-store";
 import { buildCanvasResourceReferences, buildNodeMentionReferences } from "../utils/canvas-resource-references";
-import type { AssistantToolDispatcher } from "../utils/assistant-tools";
+import { type AssistantSpeakWithVoiceResult, type AssistantToolDispatcher, buildShortIdMap } from "../utils/assistant-tools";
 import {
     CanvasNodeType,
     type CanvasAssistantAudio,
@@ -1422,6 +1426,8 @@ function InfiniteCanvasPage() {
         setNodes((prev) => prev.map((node) => (node.id === nodeId ? applyNodeConfigPatch(node, patch) : node)));
     }, []);
 
+    const openVoiceCloneDialog = useCanvasVoiceCloneStore((state) => state.openDialog);
+
     const downloadNodeImage = useCallback((node: CanvasNodeData) => {
         if ((node.type !== CanvasNodeType.Image && node.type !== CanvasNodeType.Video && node.type !== CanvasNodeType.Audio) || !node.metadata?.content) return;
         saveAs(node.metadata.content, `canvas-${node.type}-${node.id}.${node.type === CanvasNodeType.Video ? "mp4" : node.type === CanvasNodeType.Audio ? audioExtension(node.metadata.mimeType) : imageExtension(node.metadata.content)}`);
@@ -2045,6 +2051,7 @@ function InfiniteCanvasPage() {
                     setNodes((prev) => (isEmptyAudioNode ? prev.map((node) => (node.id === nodeId ? { ...node, ...audioNode } : node)) : [...prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_SUCCESS } } : node)), audioNode]));
                     if (!isEmptyAudioNode) setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: nodeId, toNodeId: audioId }]);
                     const audio = await storeGeneratedAudio(await requestAudioGeneration(generationConfig, effectivePrompt), generationConfig.audioFormat);
+                    touchCustomVoiceIfApplicable(projectId, generationConfig.audioVoice);
                     setNodes((prev) => prev.map((node) => (node.id === audioId ? { ...node, metadata: { ...node.metadata, ...audioMetadata(audio), prompt: effectivePrompt, ...buildAudioGenerationMetadata(generationConfig) } } : node)));
                     return;
                 }
@@ -2170,6 +2177,7 @@ function InfiniteCanvasPage() {
                 }
                 if (node.type === CanvasNodeType.Audio) {
                     const audio = await storeGeneratedAudio(await requestAudioGeneration(generationConfig, prompt), generationConfig.audioFormat);
+                    touchCustomVoiceIfApplicable(projectId, generationConfig.audioVoice);
                     setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, ...audioMetadata(audio), prompt, ...buildAudioGenerationMetadata(generationConfig) } } : item)));
                     return;
                 }
@@ -2203,6 +2211,40 @@ function InfiniteCanvasPage() {
             }
         },
         [effectiveConfig, message, openConfigDialog],
+    );
+
+    /**
+     * 右键菜单"朗读"项的入口：把 Text 节点的内容当作 prompt，按指定音色生成一个
+     * Audio 子节点。voiceId 为空字符串等于"使用画布默认音色"——会清掉 Text 节点上
+     * 之前留下的音色偏好；voiceId 非空时强制 model 为某个 Vidu 音频模型，因为
+     * 复刻音色 voice_id 只在 Vidu 渠道有意义。
+     *
+     * 写完 metadata 后用一个微任务等 React 把 setNodes 提交进去，再调用
+     * handleGenerateNode（它通过 nodesRef 读取 sourceNode）；这样 generationConfig 就能
+     * 命中刚写进去的 audioVoice / model。
+     */
+    const speakTextNodeWithVoice = useCallback(
+        (textNodeId: string, voiceId: string) => {
+            const node = nodesRef.current.find((item) => item.id === textNodeId);
+            if (!node || node.type !== CanvasNodeType.Text) return;
+            const content = (node.metadata?.content || "").trim();
+            if (!content) {
+                message.warning("文本节点没有内容，无法朗读");
+                return;
+            }
+            if (voiceId) {
+                const fallbackModel = isViduAudioModel(effectiveConfig.audioModel) ? effectiveConfig.audioModel : "vidu-audio-tts";
+                handleConfigNodeChange(textNodeId, { audioVoice: voiceId, model: fallbackModel });
+            } else {
+                // "使用默认音色"语义上是清空 Text 节点的偏好，让 generationConfig 完全走全局默认；
+                // 否则上次右键选过的音色会"粘"在 Text 节点上，下次选默认时还在用旧音色。
+                handleConfigNodeChange(textNodeId, { audioVoice: undefined, model: undefined });
+            }
+            // setTimeout 给 React 一次 commit 机会，使 nodesRef 拿到最新 metadata；
+            // 0ms 已经足够（macrotask 在下一个 tick 执行），不需要 requestAnimationFrame。
+            setTimeout(() => void handleGenerateNode(textNodeId, "audio", content), 0);
+        },
+        [effectiveConfig.audioModel, handleConfigNodeChange, handleGenerateNode, message],
     );
 
     const generateImageFromTextNode = useCallback(
@@ -2329,6 +2371,74 @@ function InfiniteCanvasPage() {
         [screenToCanvas, size.height, size.width],
     );
 
+    /**
+     * 助手 speak_with_voice 工具的实现。和右键朗读不同：助手没有 sourceNode，需要
+     * 自己先建一个 Text 节点承载文本，再建一个 Audio 子节点跑 TTS 并连线。流程上
+     * 等待 TTS 完成后再 resolve，让助手在下一轮 LLM 调用里能拿到生成结果（比如
+     * 音频节点短编号 n_uX）。
+     *
+     * 不复用 handleGenerateNode 是因为那条路径假设有源节点 + 用 buildGenerationConfig
+     * 拼接上游 prompt；这里需求更简单——把 text 当 prompt 直接送 TTS 即可。
+     */
+    const assistantSpeakWithVoice = useCallback(
+        async ({ voiceId, text, position }: { voiceId: string; text: string; position?: Position }): Promise<AssistantSpeakWithVoiceResult> => {
+            const trimmed = (text || "").trim();
+            if (!trimmed) return { ok: false, summary: "text 为空，未发起 TTS" };
+            if (!isAiConfigReady(effectiveConfig, effectiveConfig.audioModel)) {
+                openConfigDialog(true);
+                return { ok: false, summary: "音频模型未配置，已为用户打开配置对话框" };
+            }
+            const center = position || getCanvasCenter();
+            const audioSpec = NODE_DEFAULT_SIZE[CanvasNodeType.Audio];
+            const SPEAK_GAP = 32;
+
+            // 决定 model + voice：voiceId 非空时强制 vidu-audio-tts（仅 Vidu 渠道认 voice_id）；
+            // voiceId 为空时完全走 effectiveConfig.audioVoice / audioModel 的默认值。
+            const useViduForCustomVoice = isViduAudioModel(effectiveConfig.audioModel) ? effectiveConfig.audioModel : "vidu-audio-tts";
+            const audioConfig: AiConfig = {
+                ...effectiveConfig,
+                model: voiceId ? useViduForCustomVoice : effectiveConfig.audioModel,
+                audioModel: voiceId ? useViduForCustomVoice : effectiveConfig.audioModel,
+                audioVoice: voiceId || effectiveConfig.audioVoice,
+            };
+
+            // 1. 先创建 Text + Audio + 连线（同步，立即可见）。
+            const textNode: CanvasNodeData = {
+                ...createCanvasNode(CanvasNodeType.Text, { x: center.x - audioSpec.width - SPEAK_GAP, y: center.y }, { content: trimmed, status: NODE_STATUS_SUCCESS }),
+            };
+            const audioNode: CanvasNodeData = {
+                ...createCanvasNode(CanvasNodeType.Audio, { x: center.x + SPEAK_GAP, y: center.y }, { prompt: trimmed, status: NODE_STATUS_LOADING, ...buildAudioGenerationMetadata(audioConfig) }),
+            };
+            const connection: CanvasConnection = { id: nanoid(), fromNodeId: textNode.id, toNodeId: audioNode.id };
+            setNodes((prev) => [...prev, textNode, audioNode]);
+            setConnections((prev) => [...prev, connection]);
+
+            try {
+                const audio = await storeGeneratedAudio(await requestAudioGeneration(audioConfig, trimmed), audioConfig.audioFormat);
+                touchCustomVoiceIfApplicable(projectId, audioConfig.audioVoice);
+                setNodes((prev) =>
+                    prev.map((node) => (node.id === audioNode.id ? { ...node, metadata: { ...node.metadata, ...audioMetadata(audio), prompt: trimmed, ...buildAudioGenerationMetadata(audioConfig) } } : node)),
+                );
+                // 重新 build short id 以反映新增的两个节点；助手得到 audio 节点的稳定短编号。
+                const shortMap = buildShortIdMap(nodesRef.current);
+                const audioShortId = shortMap.toShort.get(audioNode.id);
+                return {
+                    ok: true,
+                    summary: `已用音色 ${audioConfig.audioVoice || "默认"} 朗读完成，音频节点 ${audioShortId || "?"}`,
+                    audioNodeShortId: audioShortId,
+                    voiceId: audioConfig.audioVoice,
+                };
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : "TTS 失败";
+                setNodes((prev) =>
+                    prev.map((node) => (node.id === audioNode.id ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_ERROR, errorDetails: msg } } : node)),
+                );
+                return { ok: false, summary: `朗读失败：${msg}` };
+            }
+        },
+        [effectiveConfig, getCanvasCenter, isAiConfigReady, openConfigDialog, projectId],
+    );
+
     const assistantToolDispatcher = useMemo<AssistantToolDispatcher>(
         () => ({
             getNodes: () => nodesRef.current,
@@ -2338,8 +2448,13 @@ function InfiniteCanvasPage() {
             setConnections: (updater) => setConnections(updater),
             setSelectedNodeIds: (ids) => setSelectedNodeIds(ids),
             getCanvasCenter,
+            getCustomVoices: () => currentProject?.customVoices || [],
+            openVoiceCloneDialog: () => {
+                if (projectId) openVoiceCloneDialog(projectId);
+            },
+            speakWithVoice: assistantSpeakWithVoice,
         }),
-        [getCanvasCenter],
+        [assistantSpeakWithVoice, currentProject?.customVoices, getCanvasCenter, openVoiceCloneDialog, projectId],
     );
 
     const handleAssetInsert = useCallback(
@@ -2614,6 +2729,18 @@ function InfiniteCanvasPage() {
                             }
                             setContextMenu(null);
                         }}
+                        speak={(() => {
+                            // 仅 Text 节点 + 内容非空 + 拿得到 projectId 时挂载朗读子菜单。
+                            if (contextMenu.type !== "node" || !projectId) return undefined;
+                            const node = nodes.find((item) => item.id === contextMenu.nodeId);
+                            if (!node || node.type !== CanvasNodeType.Text) return undefined;
+                            if (!node.metadata?.content?.trim()) return undefined;
+                            return {
+                                customVoices: currentProject?.customVoices || [],
+                                onSpeakWithVoice: (voiceId: string) => speakTextNodeWithVoice(contextMenu.nodeId, voiceId),
+                                onCreateCustomVoice: () => openVoiceCloneDialog(projectId),
+                            };
+                        })()}
                     />
                 ) : null}
 
@@ -2671,6 +2798,7 @@ function InfiniteCanvasPage() {
                 </Modal>
 
                 <AssetPickerModal open={assetPickerOpen} defaultTab={assetPickerTab} onInsert={handleAssetInsert} onClose={() => setAssetPickerOpen(false)} />
+                <CanvasVoiceCloneDialog />
             </section>
             {assistantMounted ? (
                 <CanvasAssistantPanel

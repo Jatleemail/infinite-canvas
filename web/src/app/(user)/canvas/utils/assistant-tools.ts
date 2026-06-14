@@ -1,11 +1,24 @@
 import { nanoid } from "nanoid";
 
+import { isViduCustomVoiceExpired, viduCustomVoiceCountdownLabel, type CustomVoice } from "@/lib/vidu-audio";
 import { CanvasNodeType, type CanvasConnection, type CanvasNodeData, type Position } from "../types";
 import { buildCanvasSummary } from "./canvas-summary";
 
 const NODE_TEXT_DEFAULT_WIDTH = 280;
 const NODE_TEXT_DEFAULT_HEIGHT = 140;
 const ARRANGE_GAP = 32;
+
+/**
+ * speakWithVoice 完成后返回给助手的结构化结果。voiceId 与 audioNodeShortId
+ * 同时返回，便于助手在后续轮次里引用刚刚生成的音频节点（例如让用户挑节点用、
+ * 或者给生成结果连线到其他节点）。
+ */
+export type AssistantSpeakWithVoiceResult = {
+    ok: boolean;
+    summary: string;
+    audioNodeShortId?: string;
+    voiceId?: string;
+};
 
 export type AssistantToolDispatcher = {
     getNodes: () => CanvasNodeData[];
@@ -15,6 +28,16 @@ export type AssistantToolDispatcher = {
     setConnections: (updater: (prev: CanvasConnection[]) => CanvasConnection[]) => void;
     setSelectedNodeIds: (ids: Set<string>) => void;
     getCanvasCenter: () => Position;
+    /** 当前画布的复刻音色清单。可选——主要供 voice 类工具消费；老用法不传也兼容。 */
+    getCustomVoices?: () => CustomVoice[];
+    /** 触发声音复刻对话框（半工具——不替用户自动复刻）。可选。 */
+    openVoiceCloneDialog?: () => void;
+    /**
+     * 用指定音色朗读一段文字：在画布上落地一个 text + audio 节点对，等待 TTS 完成后
+     * 再 resolve。voiceId 为空字符串等于"默认音色"。返回值会被序列化进 tool result，
+     * 助手能在下一轮看到生成的 audioNodeShortId。
+     */
+    speakWithVoice?: (args: { voiceId: string; text: string; position?: Position }) => Promise<AssistantSpeakWithVoiceResult>;
 };
 
 export type AssistantToolCall = {
@@ -202,6 +225,43 @@ export const ASSISTANT_TOOL_SCHEMAS: ChatToolSchema[] = [
             },
         },
     },
+    {
+        type: "function",
+        function: {
+            name: "list_custom_voices",
+            description: "列出当前画布里用户已有的复刻音色。返回包括 voiceId、label、剩余有效期文本（如\"剩 6 天\"）和过期标记，便于助手回答\"我有哪些音色\"或决定 speak_with_voice 该用哪个 voice_id。无副作用。",
+            parameters: { type: "object", properties: {}, additionalProperties: false },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "open_voice_clone_dialog",
+            description: "弹出\"声音复刻\"对话框，把用户引导到上传 mp3 + 填表单的界面；本工具不会自动复刻、不会扣费、不会上传任何音频，对话框关掉前用户可以随时取消。建议在用户说\"克隆我的声音\"且 list_custom_voices 没有可用音色时调用。",
+            parameters: { type: "object", properties: {}, additionalProperties: false },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "speak_with_voice",
+            description:
+                "用指定音色（包含内置音色或复刻音色 voice_id）朗读一段文本：自动在画布上创建一个 Text 节点和一个 Audio 子节点并连线，等待 TTS 完成后才返回。\n" +
+                "voice_id 为空字符串等于使用画布默认音色；voice_id 必须事先通过 list_custom_voices 取得，或是用户已经在画布上配置过的合法音色，不要凭空捏造。\n" +
+                "用于场景：用户已经有想要朗读的文本 + 偏好音色，希望助手直接产出可播放的音频节点。",
+            parameters: {
+                type: "object",
+                properties: {
+                    voice_id: { type: "string", description: "音色 ID；空字符串表示使用默认音色" },
+                    text: { type: "string", description: "要朗读的文本，1000 字以内" },
+                    x: { type: "number", description: "可选画布 X 坐标，省略时落在视口中心" },
+                    y: { type: "number", description: "可选画布 Y 坐标，省略时落在视口中心" },
+                },
+                required: ["voice_id", "text"],
+                additionalProperties: false,
+            },
+        },
+    },
 ];
 
 /**
@@ -309,6 +369,55 @@ export async function executeAssistantTool(call: AssistantToolCall, dispatcher: 
                 prev.map((node) => (node.id === realId ? { ...node, metadata: { ...(node.metadata || {}), prompt: newPrompt } } : node)),
             );
             return { ok: true, summary: `已更新节点 ${shortId} 的 prompt` };
+        }
+        case "list_custom_voices": {
+            // 只读工具，不需要 dispatcher 提供方法时返回空列表，让助手知道复刻能力未启用
+            // 而不是把工具调用判失败——这样它会在回复里坦白告诉用户。
+            const voices = dispatcher.getCustomVoices?.() || [];
+            const now = Date.now();
+            const data = voices.map((voice) => ({
+                voice_id: voice.voiceId,
+                label: voice.label || voice.voiceId,
+                expires_in: viduCustomVoiceCountdownLabel(voice, now),
+                expired: isViduCustomVoiceExpired(voice, now),
+            }));
+            return {
+                ok: true,
+                summary: voices.length ? `当前画布有 ${voices.length} 个复刻音色` : "当前画布没有复刻音色",
+                data: { voices: data },
+            };
+        }
+        case "open_voice_clone_dialog": {
+            if (!dispatcher.openVoiceCloneDialog) {
+                return { ok: false, summary: "当前环境不支持声音复刻" };
+            }
+            dispatcher.openVoiceCloneDialog();
+            return {
+                ok: true,
+                summary: "已打开声音复刻对话框，请在弹出的对话框里上传音频样本并点确认",
+            };
+        }
+        case "speak_with_voice": {
+            if (!dispatcher.speakWithVoice) {
+                return { ok: false, summary: "当前环境不支持声音合成" };
+            }
+            const voiceId = typeof call.args.voice_id === "string" ? call.args.voice_id : "";
+            const text = typeof call.args.text === "string" ? call.args.text.trim() : "";
+            if (!text) return { ok: false, summary: "text 为空" };
+            if (Array.from(text).length > 1000) return { ok: false, summary: "text 超过 1000 字符上限" };
+            const x = typeof call.args.x === "number" ? call.args.x : undefined;
+            const y = typeof call.args.y === "number" ? call.args.y : undefined;
+            const position = x != null && y != null ? { x, y } : undefined;
+            // speakWithVoice 自身负责创建节点 + 调 TTS + 等待完成；这里把 short id
+            // 也透出去，让助手知道刚生成的音频节点编号。
+            const result = await dispatcher.speakWithVoice({ voiceId, text, position });
+            return {
+                ok: result.ok,
+                summary: result.summary,
+                data: result.audioNodeShortId
+                    ? { audio_node_id: result.audioNodeShortId, voice_id: result.voiceId }
+                    : undefined,
+            };
         }
         default:
             return { ok: false, summary: `未知工具：${call.name}` };

@@ -1,16 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
+import { useParams } from "next/navigation";
 import { Settings2 } from "lucide-react";
 import { Button } from "antd";
 
 import { AudioSettingsPanel } from "@/components/audio-settings-panel";
 import { audioFormatLabel, audioSpeedLabel, audioVoiceLabel } from "@/lib/audio-generation";
 import { canvasThemes } from "@/lib/canvas-theme";
-import { isViduAudioModel, viduVoiceLabel } from "@/lib/vidu-audio";
+import { isViduAudioModel, viduVoiceLabel, type CustomVoice } from "@/lib/vidu-audio";
 import { useThemeStore } from "@/stores/use-theme-store";
 import type { AiConfig } from "@/stores/use-config-store";
+import { useCanvasStore } from "../stores/use-canvas-store";
+import { useCanvasVoiceCloneStore } from "../stores/use-canvas-voice-clone-store";
 
 export type CanvasAudioSettingKey = "audioVoice" | "audioFormat" | "audioSpeed" | "audioInstructions";
 
@@ -19,10 +22,44 @@ type CanvasAudioSettingsPopoverProps = {
     onConfigChange: (key: CanvasAudioSettingKey, value: string) => void;
     buttonClassName?: string;
     placement?: "topLeft" | "top" | "topRight" | "bottomLeft" | "bottom" | "bottomRight";
+    /**
+     * 当前画布的复刻音色清单。不传时 popover 会用 useParams + useCanvasStore 自己取
+     * （画布内默认行为）；显式传入用于外部场景（如画布外的预览）。
+     */
+    customVoices?: CustomVoice[];
+    /**
+     * 点击"上传 mp3 复刻新音色"的回调。不传时 popover 会自动调用 useCanvasVoiceCloneStore
+     * 弹出全局复刻对话框（画布内默认行为）；显式传入用于自定义流程或测试。
+     */
+    onCreateCustomVoice?: () => void;
+    /**
+     * 删除某个复刻音色的回调。不传时调用 useCanvasStore.removeCustomVoice。
+     */
+    onRemoveCustomVoice?: (voiceId: string) => void;
 };
 
-export function CanvasAudioSettingsPopover({ config, onConfigChange, buttonClassName, placement = "topLeft" }: CanvasAudioSettingsPopoverProps) {
+export function CanvasAudioSettingsPopover({
+    config,
+    onConfigChange,
+    buttonClassName,
+    placement = "topLeft",
+    customVoices: customVoicesProp,
+    onCreateCustomVoice: onCreateCustomVoiceProp,
+    onRemoveCustomVoice: onRemoveCustomVoiceProp,
+}: CanvasAudioSettingsPopoverProps) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    // 画布路由 [id] 下默认能拿到 projectId；其他场景下 useParams 返回的 id 可能为 undefined。
+    const params = useParams<{ id?: string }>();
+    const projectId = customVoicesProp ? null : params?.id || null;
+    const projectVoices = useCanvasStore((state) => (projectId ? state.projects.find((item) => item.id === projectId)?.customVoices : undefined));
+    const removeCustomVoice = useCanvasStore((state) => state.removeCustomVoice);
+    const openCloneDialog = useCanvasVoiceCloneStore((state) => state.openDialog);
+
+    // 优先用外部传入；否则用 store 中的；都没有就空数组。
+    const customVoices = useMemo(() => customVoicesProp ?? projectVoices ?? [], [customVoicesProp, projectVoices]);
+    const onCreateCustomVoice = onCreateCustomVoiceProp ?? (projectId ? () => openCloneDialog(projectId) : undefined);
+    const onRemoveCustomVoice = onRemoveCustomVoiceProp ?? (projectId ? (voiceId: string) => removeCustomVoice(projectId, voiceId) : undefined);
+
     const buttonRef = useRef<HTMLSpanElement>(null);
     const panelRef = useRef<HTMLDivElement>(null);
     const [open, setOpen] = useState(false);
@@ -49,9 +86,22 @@ export function CanvasAudioSettingsPopover({ config, onConfigChange, buttonClass
         };
     }, [open]);
 
-    const panel = open && buttonRect ? <AudioSettingsPortal buttonRect={buttonRect} panelRef={panelRef} placement={placement} theme={theme} config={config} onConfigChange={onConfigChange} /> : null;
+    const panel =
+        open && buttonRect ? (
+            <AudioSettingsPortal
+                buttonRect={buttonRect}
+                panelRef={panelRef}
+                placement={placement}
+                theme={theme}
+                config={config}
+                onConfigChange={onConfigChange}
+                customVoices={customVoices}
+                onCreateCustomVoice={onCreateCustomVoice}
+                onRemoveCustomVoice={onRemoveCustomVoice}
+            />
+        ) : null;
     const isVidu = isViduAudioModel(config.model || config.audioModel);
-    const voiceText = isVidu ? viduVoiceLabel(config.audioVoice) : audioVoiceLabel(config.audioVoice);
+    const voiceText = isVidu ? viduVoiceLabel(config.audioVoice, customVoices) : audioVoiceLabel(config.audioVoice);
     const summary = isVidu ? `${voiceText} · MP3 · ${audioSpeedLabel(config.audioSpeed)}` : `${voiceText} · ${audioFormatLabel(config.audioFormat)} · ${audioSpeedLabel(config.audioSpeed)}`;
 
     return (
@@ -73,6 +123,9 @@ function AudioSettingsPortal({
     theme,
     config,
     onConfigChange,
+    customVoices,
+    onCreateCustomVoice,
+    onRemoveCustomVoice,
 }: {
     buttonRect: DOMRect;
     panelRef: RefObject<HTMLDivElement | null>;
@@ -80,6 +133,9 @@ function AudioSettingsPortal({
     theme: (typeof canvasThemes)[keyof typeof canvasThemes];
     config: AiConfig;
     onConfigChange: (key: CanvasAudioSettingKey, value: string) => void;
+    customVoices: CustomVoice[];
+    onCreateCustomVoice?: () => void;
+    onRemoveCustomVoice?: (voiceId: string) => void;
 }) {
     const width = 356;
     const gap = 8;
@@ -111,7 +167,15 @@ function AudioSettingsPortal({
             onMouseDown={(event) => event.stopPropagation()}
             onClick={(event) => event.stopPropagation()}
         >
-            <AudioSettingsPanel config={config} onConfigChange={(key, value) => onConfigChange(key, value)} theme={theme} className="space-y-4" />
+            <AudioSettingsPanel
+                config={config}
+                onConfigChange={(key, value) => onConfigChange(key, value)}
+                theme={theme}
+                className="space-y-4"
+                customVoices={customVoices}
+                onCreateCustomVoice={onCreateCustomVoice}
+                onRemoveCustomVoice={onRemoveCustomVoice}
+            />
         </div>,
         document.body,
     );
